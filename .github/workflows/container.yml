@@ -1,6 +1,6 @@
 name: deploy-container
 
-on: 
+on:
   workflow_dispatch:
   push:
     branches:
@@ -34,3 +34,69 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: "us-east-2"
+
+      - name: Deploy CloudFront SPA routing function
+        run: |
+          FUNCTION_NAME="mfp-container-spa-routing"
+
+          EXISTING_ETAG=$(aws cloudfront describe-function --name $FUNCTION_NAME \
+            --query 'ETag' --output text 2>/dev/null || echo "")
+
+          if [ -z "$EXISTING_ETAG" ]; then
+            RESULT=$(aws cloudfront create-function \
+              --name $FUNCTION_NAME \
+              --function-config '{"Comment":"SPA routing for MFP container","Runtime":"cloudfront-js-2.0"}' \
+              --function-code fileb://cloudfront-spa-function.js)
+          else
+            RESULT=$(aws cloudfront update-function \
+              --name $FUNCTION_NAME \
+              --if-match $EXISTING_ETAG \
+              --function-config '{"Comment":"SPA routing for MFP container","Runtime":"cloudfront-js-2.0"}' \
+              --function-code fileb://cloudfront-spa-function.js)
+          fi
+
+          PUBLISH_ETAG=$(echo $RESULT | python3 -c "import sys,json; print(json.load(sys.stdin)['ETag'])")
+          aws cloudfront publish-function --name $FUNCTION_NAME --if-match $PUBLISH_ETAG
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: "us-east-1"
+
+      - name: Update CloudFront distribution config
+        run: |
+          DIST_ID=${{ secrets.AWS_DISTRIBUTION_ID }}
+          FUNCTION_NAME="mfp-container-spa-routing"
+
+          FUNCTION_ARN=$(aws cloudfront describe-function --name $FUNCTION_NAME \
+            --query 'FunctionSummary.FunctionMetadata.FunctionARN' --output text)
+
+          CONFIG_JSON=$(aws cloudfront get-distribution-config --id $DIST_ID)
+          ETAG=$(echo $CONFIG_JSON | python3 -c "import sys,json; print(json.load(sys.stdin)['ETag'])")
+
+          echo $CONFIG_JSON | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          config = data['DistributionConfig']
+          import os
+          function_arn = os.environ['FUNCTION_ARN']
+
+          # viewer-request에 함수 연결
+          dcb = config['DefaultCacheBehavior']
+          items = [fa for fa in dcb.get('FunctionAssociations', {}).get('Items', [])
+                   if fa['EventType'] != 'viewer-request']
+          items.append({'FunctionARN': function_arn, 'EventType': 'viewer-request'})
+          dcb['FunctionAssociations'] = {'Quantity': len(items), 'Items': items}
+
+          # Custom Error Responses 제거
+          config['CustomErrorResponses'] = {'Quantity': 0}
+          print(json.dumps(config))
+          " FUNCTION_ARN=$FUNCTION_ARN > updated-dist-config.json
+
+          aws cloudfront update-distribution \
+            --id $DIST_ID \
+            --if-match $ETAG \
+            --distribution-config file://updated-dist-config.json
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: "us-east-1"
